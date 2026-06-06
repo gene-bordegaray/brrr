@@ -1,0 +1,18 @@
+Alpha;1.0
+Beta;-2.0
+Gamma;0.0
+Alpha;2.0
+Beta;-3.0
+Delta;10.0
+Epsilon;-10.0
+Alpha;-1.0
+Beta;5.0
+Epsilon;10.0
+New York;12.3
+RoundingUp;1.0
+RoundingUp;2.0
+RoundingUp;2.0
+NegativeRound;-1.0
+NegativeRound;-2.0
+NegativeRound;-2.0
+Zulu;99.9
