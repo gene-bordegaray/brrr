@@ -69,18 +69,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut station_stats_map: HashMap<String, StationStats> = HashMap::new();
 
     for line in reader.lines() {
-        let line = line?;
-
-        let (station, val) = line
+        let curr_line = line?;
+        let (station, val) = curr_line
             .split_once(DELIMITER)
             .ok_or_else(|| "malformed line, did not find delimiter ';'")?;
-
         let val: f32 = val.parse()?;
 
-        station_stats_map
-            .entry(station.to_string())
-            .and_modify(|stats| stats.update_stats(val))
-            .or_insert_with(|| StationStats::new(val));
+        if let Some(stats) = station_stats_map.get_mut(station) {
+            stats.update_stats(val);
+        } else {
+            station_stats_map.insert(station.to_string(), StationStats::new(val));
+        }
     }
 
     print_final_results(&station_stats_map);
