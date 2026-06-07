@@ -7,7 +7,8 @@ use std::io::{BufRead, BufReader};
 const DELIMITER: u8 = b';';
 const NEW_LINE_MARKER: u8 = b'\n';
 /// Station Name (100 bytes) + Delimiter (1 byte) + Value (5 bytes)
-const MAX_LINE_BYTES: u8 = 100 + 1 + 5;
+const MAX_LINE_BYTES: usize = 100 + 1 + 5;
+const MAX_UNIQUE_STATIONS: usize = 10_000;
 
 struct StationStats {
     min: i32,
@@ -123,8 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
-    let mut station_stats_map: HashMap<Vec<u8>, StationStats> = HashMap::new();
-    let mut curr_line: Vec<u8> = Vec::with_capacity(MAX_LINE_BYTES as usize);
+    let mut station_stats_map: HashMap<Vec<u8>, StationStats> =
+        HashMap::with_capacity(MAX_UNIQUE_STATIONS);
+    let mut curr_line: Vec<u8> = Vec::with_capacity(MAX_LINE_BYTES);
 
     loop {
         let Some(delimiter_idx) = read_line(&mut reader, &mut curr_line)? else {
