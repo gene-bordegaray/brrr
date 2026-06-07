@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 const DELIMITER: char = ';';
+/// Station Name (100 bytes) + Delimiter (1 byte) + Value (5 bytes)
+const MAX_LINE_BYTES: u8 = 100 + 1 + 5;
 
 struct StationStats {
     min: f32,
@@ -64,22 +66,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: weather <path-to-measurements-file>")?;
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut station_stats_map: HashMap<String, StationStats> = HashMap::new();
+    let mut curr_line = String::with_capacity(MAX_LINE_BYTES as usize);
 
-    for line in reader.lines() {
-        let curr_line = line?;
+    loop {
+        let bytes_read = reader.read_line(&mut curr_line)?;
+        if bytes_read <= 0 {
+            break;
+        }
+
         let (station, val) = curr_line
+            .trim()
             .split_once(DELIMITER)
             .ok_or_else(|| "malformed line, did not find delimiter ';'")?;
-        let val: f32 = val.parse()?;
+        let val: f32 = val.trim().parse()?;
 
         if let Some(stats) = station_stats_map.get_mut(station) {
             stats.update_stats(val);
         } else {
             station_stats_map.insert(station.to_string(), StationStats::new(val));
         }
+
+        curr_line.clear();
     }
 
     print_final_results(&station_stats_map);
