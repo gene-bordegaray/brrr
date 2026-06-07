@@ -33,44 +33,48 @@ impl StationStats {
         self.count += 1;
     }
 
-    fn mean(&self) -> f32 {
-        self.sum as f32 / self.count as f32 / 10.0
+    fn mean_rounded_tenths(&self) -> i32 {
+        (self.sum as f32 / self.count as f32).round() as i32
     }
 }
 
-fn tenths_to_f32(val: i32) -> f32 {
-    val as f32 / 10.0
+fn fmt_tenths(f: &mut fmt::Formatter<'_>, val: i32) -> fmt::Result {
+    if val < 0 && val > -10 {
+        write!(f, "-0.{}", -val)
+    } else {
+        write!(f, "{}.{}", val / 10, val.abs() % 10)
+    }
 }
 
 impl fmt::Display for StationStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:.1}/{:.1}/{:.1}",
-            tenths_to_f32(self.min),
-            self.mean(),
-            tenths_to_f32(self.max)
-        )
+        fmt_tenths(f, self.min)?;
+        write!(f, "/")?;
+        fmt_tenths(f, self.mean_rounded_tenths())?;
+        write!(f, "/")?;
+        fmt_tenths(f, self.max)
     }
 }
 
-fn read_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<u8>> {
+fn read_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
     buf.clear();
 
-    let bytes_read: u8 = reader.read_until(DELIMITER, buf)? as u8;
+    let bytes_read = reader.read_until(NEW_LINE_MARKER, buf)?;
     if bytes_read == 0 {
         return Ok(None);
     }
-
-    let delimiter_idx = bytes_read;
-
-    reader.read_until(NEW_LINE_MARKER, buf)?;
 
     if buf.ends_with(&[NEW_LINE_MARKER]) {
         buf.pop();
     }
 
-    Ok(Some(delimiter_idx))
+    for (delimiter_idx, byte) in buf.iter().enumerate() {
+        if *byte == DELIMITER {
+            return Ok(Some(delimiter_idx));
+        }
+    }
+
+    Ok(None)
 }
 
 fn parse_temp_tenths(bytes: &[u8]) -> i32 {
@@ -127,8 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         };
         let delimiter_idx = delimiter_idx as usize;
-        let station = &curr_line[..delimiter_idx - 1];
-        let val = parse_temp_tenths(&curr_line[delimiter_idx..]);
+        let station = &curr_line[..delimiter_idx];
+        let val = parse_temp_tenths(&curr_line[delimiter_idx + 1..]);
 
         if let Some(stats) = station_stats_map.get_mut(station) {
             stats.update_stats(val);
