@@ -2,13 +2,20 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
+
+/// ---- Facts ----
 
 const DELIMITER: u8 = b';';
 const NEW_LINE_MARKER: u8 = b'\n';
 /// Station Name (100 bytes) + Delimiter (1 byte) + Value (5 bytes)
 const MAX_LINE_BYTES: usize = 100 + 1 + 5;
 const MAX_UNIQUE_STATIONS: usize = 10_000;
+
+/// ---- Heuristics ----
+
+/// Size of buffer read file into at a time.
+const DEFAULT_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 struct StationStats {
     min: i32,
@@ -57,25 +64,116 @@ impl fmt::Display for StationStats {
     }
 }
 
-fn read_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
-    buf.clear();
+struct Aggregator {
+    station_map: HashMap<Vec<u8>, StationStats>,
+}
 
-    let bytes_read = reader.read_until(NEW_LINE_MARKER, buf)?;
-    if bytes_read == 0 {
-        return Ok(None);
-    }
-
-    if buf.ends_with(&[NEW_LINE_MARKER]) {
-        buf.pop();
-    }
-
-    for (delimiter_idx, byte) in buf.iter().enumerate() {
-        if *byte == DELIMITER {
-            return Ok(Some(delimiter_idx));
+impl Aggregator {
+    fn new(station_map_size: usize) -> Self {
+        Self {
+            station_map: HashMap::with_capacity(station_map_size),
         }
     }
 
-    Ok(None)
+    fn station_map(&self) -> &HashMap<Vec<u8>, StationStats> {
+        &self.station_map
+    }
+
+    fn update(&mut self, station: &[u8], val: i32) {
+        if let Some(stats) = self.station_map.get_mut(station) {
+            stats.update_stats(val);
+        } else {
+            self.station_map
+                .insert(station.to_vec(), StationStats::new(val));
+        }
+    }
+}
+
+struct FileScanner {
+    file: File,
+    buf: Vec<u8>,
+    leftover: Vec<u8>,
+}
+
+impl FileScanner {
+    fn new(file: File, buf_size: usize) -> Self {
+        Self {
+            file,
+            buf: vec![0u8; buf_size],
+            leftover: Vec::with_capacity(MAX_LINE_BYTES),
+        }
+    }
+
+    fn read_next_chunk(&mut self) -> std::io::Result<Option<(usize, bool)>> {
+        let leftover_len = self.leftover.len();
+        if leftover_len >= self.buf.len() {
+            self.buf.resize(leftover_len + DEFAULT_BUF_SIZE, 0);
+        }
+
+        self.buf[..leftover_len].copy_from_slice(&self.leftover);
+        self.leftover.clear();
+
+        let bytes_read = self.file.read(&mut self.buf[leftover_len..])?;
+        let valid_len = leftover_len + bytes_read;
+
+        if valid_len == 0 {
+            return Ok(None);
+        }
+
+        let at_eof = bytes_read == 0;
+        Ok(Some((valid_len, at_eof)))
+    }
+
+    /// Reads one chunk, scans complete rows, and updates the aggregator.
+    /// If the last row is split across chunks, its bytes are saved in `leftover`.
+    fn scan_chunk(&mut self, aggregator: &mut Aggregator) -> std::io::Result<bool> {
+        let Some((valid_len, at_eof)) = self.read_next_chunk()? else {
+            return Ok(false);
+        };
+
+        let mut idx = 0;
+
+        while idx < valid_len {
+            let station_start = idx;
+            while idx < valid_len && self.buf[idx] != DELIMITER {
+                idx += 1;
+            }
+
+            if idx == valid_len {
+                if !at_eof {
+                    self.leftover
+                        .extend_from_slice(&self.buf[station_start..valid_len]);
+                }
+                break;
+            }
+
+            let delimiter_idx = idx;
+            let station = &self.buf[station_start..delimiter_idx];
+            idx += 1;
+
+            while idx < valid_len && self.buf[idx] != NEW_LINE_MARKER {
+                idx += 1;
+            }
+
+            if idx == valid_len {
+                if at_eof {
+                    let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
+                    aggregator.update(station, val);
+                } else {
+                    self.leftover
+                        .extend_from_slice(&self.buf[station_start..valid_len]);
+                }
+                break;
+            }
+
+            let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
+            aggregator.update(station, val);
+
+            idx += 1;
+        }
+
+        Ok(true)
+    }
 }
 
 fn parse_temp_tenths(bytes: &[u8]) -> i32 {
@@ -122,28 +220,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: weather <path-to-measurements-file>")?;
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut scanner = FileScanner::new(file, DEFAULT_BUF_SIZE);
+    let mut aggregator = Aggregator::new(MAX_UNIQUE_STATIONS);
 
-    let mut station_stats_map: HashMap<Vec<u8>, StationStats> =
-        HashMap::with_capacity(MAX_UNIQUE_STATIONS);
-    let mut curr_line: Vec<u8> = Vec::with_capacity(MAX_LINE_BYTES);
+    while scanner.scan_chunk(&mut aggregator)? {}
 
-    loop {
-        let Some(delimiter_idx) = read_line(&mut reader, &mut curr_line)? else {
-            break;
-        };
-        let delimiter_idx = delimiter_idx as usize;
-        let station = &curr_line[..delimiter_idx];
-        let val = parse_temp_tenths(&curr_line[delimiter_idx + 1..]);
-
-        if let Some(stats) = station_stats_map.get_mut(station) {
-            stats.update_stats(val);
-        } else {
-            station_stats_map.insert(station.to_vec(), StationStats::new(val));
-        }
-    }
-
-    print_final_results(&station_stats_map);
+    print_final_results(&aggregator.station_map());
 
     Ok(())
 }
