@@ -64,8 +64,16 @@ impl fmt::Display for StationStats {
     }
 }
 
+struct Entry {
+    station: Vec<u8>,
+    stats: StationStats,
+}
+
+/// Responsible for holding the running aggregation state for stations.
+///
+/// Represented as a HashMap, mapping fingerprints of station name to list of entries.
 struct Aggregator {
-    station_map: HashMap<Vec<u8>, StationStats>,
+    station_map: HashMap<u64, Vec<Entry>>,
 }
 
 impl Aggregator {
@@ -75,20 +83,33 @@ impl Aggregator {
         }
     }
 
-    fn station_map(&self) -> &HashMap<Vec<u8>, StationStats> {
+    fn station_map(&self) -> &HashMap<u64, Vec<Entry>> {
         &self.station_map
     }
 
-    fn update(&mut self, station: &[u8], val: i32) {
-        if let Some(stats) = self.station_map.get_mut(station) {
-            stats.update_stats(val);
+    fn update(&mut self, fingerprint: u64, station: &[u8], val: i32) {
+        if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
+            if let Some(entry) = bucket.iter_mut().find(|entry| entry.station == station) {
+                entry.stats.update_stats(val);
+            } else {
+                bucket.push(Entry {
+                    station: station.to_vec(),
+                    stats: StationStats::new(val),
+                });
+            }
         } else {
-            self.station_map
-                .insert(station.to_vec(), StationStats::new(val));
+            self.station_map.insert(
+                fingerprint,
+                vec![Entry {
+                    station: station.to_vec(),
+                    stats: StationStats::new(val),
+                }],
+            );
         }
     }
 }
 
+/// Responsible for scanning files and processing their bytes into a useful format.
 struct FileScanner {
     file: File,
     buf: Vec<u8>,
@@ -104,6 +125,14 @@ impl FileScanner {
         }
     }
 
+    /// Reads the nexxt chunk of `self.file` into `self.buf` accounting for leftover from teh last
+    /// chunk read.
+    ///
+    /// Returns:
+    /// - `(valid_len, at_eof)` where `valid_len` is the total bytes read into the buffer ready to
+    ///    process and `at_eof` is a marker indicating if we the chunk read through the end of the
+    ///    file.
+    /// - None if no bytes were read from `self.file`.
     fn read_next_chunk(&mut self) -> std::io::Result<Option<(usize, bool)>> {
         let leftover_len = self.leftover.len();
         if leftover_len >= self.buf.len() {
@@ -126,6 +155,10 @@ impl FileScanner {
 
     /// Reads one chunk, scans complete rows, and updates the aggregator.
     /// If the last row is split across chunks, its bytes are saved in `leftover`.
+    ///
+    /// Returns:
+    /// - `true` if any bytes wee scanned from `self.file`.
+    /// - `false` otherwise.
     fn scan_chunk(&mut self, aggregator: &mut Aggregator) -> std::io::Result<bool> {
         let Some((valid_len, at_eof)) = self.read_next_chunk()? else {
             return Ok(false);
@@ -135,7 +168,9 @@ impl FileScanner {
 
         while idx < valid_len {
             let station_start = idx;
+            let mut fingerprint = 0u64;
             while idx < valid_len && self.buf[idx] != DELIMITER {
+                fingerprint = fingerprint_step(fingerprint, self.buf[idx]);
                 idx += 1;
             }
 
@@ -158,7 +193,7 @@ impl FileScanner {
             if idx == valid_len {
                 if at_eof {
                     let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
-                    aggregator.update(station, val);
+                    aggregator.update(fingerprint, station, val);
                 } else {
                     self.leftover
                         .extend_from_slice(&self.buf[station_start..valid_len]);
@@ -167,13 +202,31 @@ impl FileScanner {
             }
 
             let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
-            aggregator.update(station, val);
+            aggregator.update(fingerprint, station, val);
 
             idx += 1;
         }
 
         Ok(true)
     }
+}
+
+/// Computes a single step of a Polynomial Rolling Hash function.
+///
+/// Formula: `hash = (hash * 31) + byte`
+///
+/// This is a popular basic hash function because:
+///
+/// - Compiler will actually optimize this into: `hash = ((hash << 5) - hash) + byte` which avoids
+///   the multiplication overehad on the CPU
+/// - Multiplying by `31` gives us a good distribution of keys because it is a prime number leading
+///   to less common factors and is a large enough prime to shift meaningfully.
+///
+/// NOTE: This is not the best hash function but a simple one. It is vulnerable to collisions which
+/// lead to linear traversals over the routed bucket. May want to update if this shows up in
+/// profiles.
+fn fingerprint_step(hash: u64, byte: u8) -> u64 {
+    hash.wrapping_mul(31).wrapping_add(byte as u64)
 }
 
 fn parse_temp_tenths(bytes: &[u8]) -> i32 {
@@ -197,18 +250,15 @@ fn parse_temp_tenths(bytes: &[u8]) -> i32 {
     sign * val
 }
 
-fn print_final_results(station_stats_map: &HashMap<Vec<u8>, StationStats>) {
-    let mut sorted_stations: Vec<_> = station_stats_map.iter().collect();
-
-    sorted_stations.sort_by_key(|(station, _stats)| *station);
-
+fn print_final_results(station_entries: &[&Entry]) {
     print!("{{");
 
-    for (i, (station, stats)) in sorted_stations.iter().enumerate() {
+    for (i, entry) in station_entries.iter().enumerate() {
         if i > 0 {
             print!(", ");
         }
-        let station = String::from_utf8_lossy(&station);
+        let station = String::from_utf8_lossy(&entry.station);
+        let stats = &entry.stats;
         print!("{station}={stats}");
     }
 
@@ -225,7 +275,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while scanner.scan_chunk(&mut aggregator)? {}
 
-    print_final_results(&aggregator.station_map());
+    let mut station_entries: Vec<&Entry> = aggregator.station_map().values().flatten().collect();
+    station_entries.sort_by(|a, b| a.station.cmp(&b.station));
+    print_final_results(&station_entries);
 
     Ok(())
 }
