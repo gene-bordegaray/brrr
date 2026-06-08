@@ -8,6 +8,7 @@ use std::io::Read;
 
 const DELIMITER: u8 = b';';
 const NEW_LINE_MARKER: u8 = b'\n';
+const DECIMAL_POINT: u8 = b'.';
 /// Station Name (100 bytes) + Delimiter (1 byte) + Value (5 bytes)
 const MAX_LINE_BYTES: usize = 100 + 1 + 5;
 const MAX_UNIQUE_STATIONS: usize = 10_000;
@@ -116,6 +117,12 @@ struct FileScanner {
     leftover: Vec<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkEnd {
+    MoreInput,
+    Eof,
+}
+
 impl FileScanner {
     fn new(file: File, buf_size: usize) -> Self {
         Self {
@@ -129,11 +136,11 @@ impl FileScanner {
     /// chunk read.
     ///
     /// Returns:
-    /// - `(valid_len, at_eof)` where `valid_len` is the total bytes read into the buffer ready to
-    ///    process and `at_eof` is a marker indicating if we the chunk read through the end of the
+    /// - `(valid_len, chunk_end)` where `valid_len` is the total bytes read into the buffer ready to
+    ///    process and `chunk_end` indicates whether this chunk reaches the end of the
     ///    file.
     /// - None if no bytes were read from `self.file`.
-    fn read_next_chunk(&mut self) -> std::io::Result<Option<(usize, bool)>> {
+    fn read_next_chunk(&mut self) -> std::io::Result<Option<(usize, ChunkEnd)>> {
         let leftover_len = self.leftover.len();
         if leftover_len >= self.buf.len() {
             self.buf.resize(leftover_len + DEFAULT_BUF_SIZE, 0);
@@ -149,8 +156,21 @@ impl FileScanner {
             return Ok(None);
         }
 
-        let at_eof = bytes_read == 0;
-        Ok(Some((valid_len, at_eof)))
+        let chunk_end = if bytes_read == 0 {
+            ChunkEnd::Eof
+        } else {
+            ChunkEnd::MoreInput
+        };
+
+        Ok(Some((valid_len, chunk_end)))
+    }
+
+    /// Extends the leftover buffer to save partial read of a row that was cut off by the buffer.
+    fn save_incomplete_row(&mut self, row_start: usize, valid_len: usize, chunk_end: ChunkEnd) {
+        if chunk_end == ChunkEnd::MoreInput {
+            self.leftover
+                .extend_from_slice(&self.buf[row_start..valid_len]);
+        }
     }
 
     /// Reads one chunk, scans complete rows, and updates the aggregator.
@@ -160,7 +180,7 @@ impl FileScanner {
     /// - `true` if any bytes wee scanned from `self.file`.
     /// - `false` otherwise.
     fn scan_chunk(&mut self, aggregator: &mut Aggregator) -> std::io::Result<bool> {
-        let Some((valid_len, at_eof)) = self.read_next_chunk()? else {
+        let Some((valid_len, chunk_end)) = self.read_next_chunk()? else {
             return Ok(false);
         };
 
@@ -175,10 +195,7 @@ impl FileScanner {
             }
 
             if idx == valid_len {
-                if !at_eof {
-                    self.leftover
-                        .extend_from_slice(&self.buf[station_start..valid_len]);
-                }
+                self.save_incomplete_row(station_start, valid_len, chunk_end);
                 break;
             }
 
@@ -186,25 +203,19 @@ impl FileScanner {
             let station = &self.buf[station_start..delimiter_idx];
             idx += 1;
 
-            while idx < valid_len && self.buf[idx] != NEW_LINE_MARKER {
-                idx += 1;
-            }
-
             if idx == valid_len {
-                if at_eof {
-                    let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
-                    aggregator.update(fingerprint, station, val);
-                } else {
-                    self.leftover
-                        .extend_from_slice(&self.buf[station_start..valid_len]);
-                }
+                self.save_incomplete_row(station_start, valid_len, chunk_end);
                 break;
             }
 
-            let val = parse_temp_tenths(&self.buf[delimiter_idx + 1..idx]);
-            aggregator.update(fingerprint, station, val);
+            let Some((val, line_end_idx)) = parse_temp_field(idx, valid_len, chunk_end, &self.buf)
+            else {
+                self.save_incomplete_row(station_start, valid_len, chunk_end);
+                break;
+            };
 
-            idx += 1;
+            aggregator.update(fingerprint, station, val);
+            idx = line_end_idx + 1;
         }
 
         Ok(true)
@@ -229,25 +240,45 @@ fn fingerprint_step(hash: u64, byte: u8) -> u64 {
     hash.wrapping_mul(31).wrapping_add(byte as u64)
 }
 
-fn parse_temp_tenths(bytes: &[u8]) -> i32 {
+fn parse_temp_field(
+    mut idx: usize,
+    valid_len: usize,
+    chunk_end: ChunkEnd,
+    buf: &[u8],
+) -> Option<(i32, usize)> {
     let mut sign = 1;
-    let mut idx = 0;
-
-    if bytes[0] == b'-' {
-        sign = -1;
-        idx = 1;
-    }
-
     let mut val = 0;
-    while bytes[idx] != b'.' {
-        val = val * 10 + (bytes[idx] - b'0') as i32;
+
+    if buf[idx] == b'-' {
+        sign = -1;
         idx += 1;
     }
 
-    idx += 1;
-    val = val * 10 + (bytes[idx] - b'0') as i32;
+    while idx < valid_len && buf[idx] != DECIMAL_POINT {
+        val = val * 10 + (buf[idx] - b'0') as i32;
+        idx += 1;
+    }
 
-    sign * val
+    if idx == valid_len {
+        return None;
+    }
+
+    idx += 1;
+
+    while idx < valid_len && buf[idx] != NEW_LINE_MARKER {
+        val = val * 10 + (buf[idx] - b'0') as i32;
+        idx += 1;
+    }
+
+    if idx == valid_len {
+        if chunk_end == ChunkEnd::Eof {
+            return Some((sign * val, idx));
+        }
+
+        return None;
+    }
+
+    Some((sign * val, idx))
 }
 
 fn print_final_results(station_entries: &[&Entry]) {
