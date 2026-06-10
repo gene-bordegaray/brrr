@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 
 /// ---- Facts ----
 
@@ -12,6 +15,7 @@ const DECIMAL_POINT: u8 = b'.';
 /// Station Name (100 bytes) + Delimiter (1 byte) + Value (5 bytes)
 const MAX_LINE_BYTES: usize = 100 + 1 + 5;
 const MAX_UNIQUE_STATIONS: usize = 10_000;
+const DEFAULT_NUM_PARTITIONS: usize = 16;
 
 /// ---- Heuristics ----
 
@@ -40,6 +44,13 @@ impl StationStats {
         self.max = self.max.max(val);
         self.sum += val as i64;
         self.count += 1;
+    }
+
+    fn merge(&mut self, other: StationStats) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
     }
 
     fn mean_rounded_tenths(&self) -> i32 {
@@ -108,28 +119,58 @@ impl Aggregator {
             );
         }
     }
+
+    fn merge(&mut self, other: Aggregator) {
+        for (fingerprint, bucket) in other.station_map {
+            for entry in bucket {
+                self.merge_entry(fingerprint, entry);
+            }
+        }
+    }
+
+    fn merge_entry(&mut self, fingerprint: u64, entry: Entry) {
+        if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
+            if let Some(existing) = bucket
+                .iter_mut()
+                .find(|existing| existing.station.as_slice() == entry.station.as_slice())
+            {
+                existing.stats.merge(entry.stats);
+            } else {
+                bucket.push(entry);
+            }
+        } else {
+            self.station_map.insert(fingerprint, vec![entry]);
+        }
+    }
 }
 
 /// Responsible for scanning files and processing their bytes into a useful format.
 struct FileScanner {
     file: File,
     buf: Vec<u8>,
+    buf_size: usize,
     leftover: Vec<u8>,
+    position: u64,
+    range_end: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChunkEnd {
     MoreInput,
-    Eof,
+    End,
 }
 
 impl FileScanner {
-    fn new(file: File, buf_size: usize) -> Self {
-        Self {
+    fn try_new(mut file: File, range: Range<u64>, buf_size: usize) -> std::io::Result<Self> {
+        file.seek(SeekFrom::Start(range.start))?;
+        Ok(Self {
             file,
             buf: vec![0u8; buf_size],
+            buf_size,
             leftover: Vec::with_capacity(MAX_LINE_BYTES),
-        }
+            position: range.start,
+            range_end: range.end,
+        })
     }
 
     /// Reads the nexxt chunk of `self.file` into `self.buf` accounting for leftover from teh last
@@ -142,22 +183,40 @@ impl FileScanner {
     /// - None if no bytes were read from `self.file`.
     fn read_next_chunk(&mut self) -> std::io::Result<Option<(usize, ChunkEnd)>> {
         let leftover_len = self.leftover.len();
+
         if leftover_len >= self.buf.len() {
-            self.buf.resize(leftover_len + DEFAULT_BUF_SIZE, 0);
+            self.buf.resize(leftover_len + self.buf_size, 0);
         }
 
         self.buf[..leftover_len].copy_from_slice(&self.leftover);
         self.leftover.clear();
 
-        let bytes_read = self.file.read(&mut self.buf[leftover_len..])?;
+        if self.position >= self.range_end {
+            if leftover_len == 0 {
+                return Ok(None);
+            }
+
+            return Ok(Some((leftover_len, ChunkEnd::End)));
+        }
+
+        let remaining = (self.range_end - self.position) as usize;
+        let read_capacity = self.buf.len() - leftover_len;
+        let read_len = remaining.min(read_capacity);
+
+        let bytes_read = self
+            .file
+            .read(&mut self.buf[leftover_len..leftover_len + read_len])?;
+
+        self.position += bytes_read as u64;
+
         let valid_len = leftover_len + bytes_read;
 
         if valid_len == 0 {
             return Ok(None);
         }
 
-        let chunk_end = if bytes_read == 0 {
-            ChunkEnd::Eof
+        let chunk_end = if self.position >= self.range_end || bytes_read == 0 {
+            ChunkEnd::End
         } else {
             ChunkEnd::MoreInput
         };
@@ -222,6 +281,8 @@ impl FileScanner {
     }
 }
 
+/// ---- Data / Conversion Helpers -----
+
 /// Computes a single step of a Polynomial Rolling Hash function.
 ///
 /// Formula: `hash = (hash * 31) + byte`
@@ -271,7 +332,7 @@ fn parse_temp_field(
     }
 
     if idx == valid_len {
-        if chunk_end == ChunkEnd::Eof {
+        if chunk_end == ChunkEnd::End {
             return Some((sign * val, idx));
         }
 
@@ -280,6 +341,64 @@ fn parse_temp_field(
 
     Some((sign * val, idx))
 }
+
+/// ---- File Helpers ----
+
+fn find_next_line_start(file: &File, offset: u64, file_len: u64) -> io::Result<u64> {
+    if offset >= file_len {
+        return Ok(file_len);
+    }
+
+    let mut buf = vec![0u8; MAX_LINE_BYTES];
+    let bytes_read = file.read_at(&mut buf, offset)?;
+
+    for (idx, byte) in buf[..bytes_read].iter().enumerate() {
+        if *byte == NEW_LINE_MARKER {
+            return Ok((offset + idx as u64 + 1).min(file_len));
+        }
+    }
+
+    Ok(file_len)
+}
+
+fn find_partition_ranges(path: &Path, partitions: usize) -> io::Result<Vec<Range<u64>>> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 || partitions == 0 {
+        return Ok(Vec::new());
+    }
+
+    let partition_size = file_len.div_ceil(partitions as u64);
+    let mut ranges = Vec::with_capacity(partitions);
+    let mut start = 0;
+
+    for partition_idx in 1..partitions {
+        let target = partition_size * partition_idx as u64;
+        if target >= file_len {
+            break;
+        }
+
+        let end = find_next_line_start(&file, target, file_len)?;
+        ranges.push(start..end);
+        start = end;
+    }
+
+    ranges.push(start..file_len);
+    Ok(ranges)
+}
+
+fn process_range(path: PathBuf, range: Range<u64>) -> std::io::Result<Aggregator> {
+    let file = File::open(path)?;
+
+    let mut scanner = FileScanner::try_new(file, range, DEFAULT_BUF_SIZE)?;
+    let mut aggregator = Aggregator::new(MAX_UNIQUE_STATIONS);
+
+    while scanner.scan_chunk(&mut aggregator)? {}
+
+    Ok(aggregator)
+}
+
+/// ---- Display Helpers ----
 
 fn print_final_results(station_entries: &[&Entry]) {
     print!("{{");
@@ -300,13 +419,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
         .nth(1)
         .ok_or("usage: weather <path-to-measurements-file>")?;
-    let file = File::open(path)?;
-    let mut scanner = FileScanner::new(file, DEFAULT_BUF_SIZE);
-    let mut aggregator = Aggregator::new(MAX_UNIQUE_STATIONS);
+    let path = PathBuf::from(path);
 
-    while scanner.scan_chunk(&mut aggregator)? {}
+    let ranges = find_partition_ranges(&path, DEFAULT_NUM_PARTITIONS)?;
 
-    let mut station_entries: Vec<&Entry> = aggregator.station_map().values().flatten().collect();
+    let handles: Vec<_> = ranges
+        .into_iter()
+        .map(|range| {
+            let path = path.clone();
+            std::thread::spawn(move || process_range(path, range))
+        })
+        .collect();
+
+    let mut final_aggregator = Aggregator::new(MAX_UNIQUE_STATIONS);
+
+    for handle in handles {
+        let partial = handle.join().unwrap()?;
+        final_aggregator.merge(partial);
+    }
+
+    let mut station_entries: Vec<&Entry> =
+        final_aggregator.station_map().values().flatten().collect();
     station_entries.sort_by(|a, b| a.station.cmp(&b.station));
     print_final_results(&station_entries);
 
