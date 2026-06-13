@@ -81,11 +81,66 @@ struct Entry {
     stats: StationStats,
 }
 
+enum Bucket {
+    Single(Entry),
+    Multi(Vec<Entry>),
+}
+
+impl Bucket {
+    fn new(entry: Entry) -> Self {
+        Self::Single(entry)
+    }
+
+    fn get_entry_mut(&mut self, station: &[u8]) -> Option<&mut Entry> {
+        return match self {
+            Bucket::Single(entry) => {
+                if entry.station == station {
+                    Some(entry)
+                } else {
+                    None
+                }
+            }
+            Bucket::Multi(entries) => entries.iter_mut().find(|entry| entry.station == station),
+        };
+    }
+
+    fn push_entry(&mut self, entry: Entry) {
+        match self {
+            Bucket::Single(_) => {
+                let old_bucket = std::mem::replace(self, Bucket::Multi(Vec::new()));
+
+                let Bucket::Single(old_entry) = old_bucket else {
+                    unreachable!();
+                };
+
+                *self = Bucket::Multi(vec![old_entry, entry]);
+            }
+            Bucket::Multi(entries) => {
+                entries.push(entry);
+            }
+        }
+    }
+
+    fn into_entries(self) -> Vec<Entry> {
+        match self {
+            Bucket::Single(entry) => vec![entry],
+            Bucket::Multi(entries) => entries,
+        }
+    }
+
+    fn entries(&self) -> &[Entry] {
+        match self {
+            Bucket::Single(entry) => std::slice::from_ref(entry),
+            Bucket::Multi(entries) => entries,
+        }
+    }
+}
+
 /// Responsible for holding the running aggregation state for stations.
 ///
 /// Represented as a HashMap, mapping fingerprints of station name to list of entries.
 struct Aggregator {
-    station_map: HashMap<u64, Vec<Entry>>,
+    station_map: HashMap<u64, Bucket>,
 }
 
 impl Aggregator {
@@ -95,16 +150,16 @@ impl Aggregator {
         }
     }
 
-    fn station_map(&self) -> &HashMap<u64, Vec<Entry>> {
+    fn station_map(&self) -> &HashMap<u64, Bucket> {
         &self.station_map
     }
 
     fn update(&mut self, fingerprint: u64, station: &[u8], val: i32) {
         if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
-            if let Some(entry) = bucket.iter_mut().find(|entry| entry.station == station) {
+            if let Some(entry) = bucket.get_entry_mut(station) {
                 entry.stats.update_stats(val);
             } else {
-                bucket.push(Entry {
+                bucket.push_entry(Entry {
                     station: station.to_vec(),
                     stats: StationStats::new(val),
                 });
@@ -112,17 +167,17 @@ impl Aggregator {
         } else {
             self.station_map.insert(
                 fingerprint,
-                vec![Entry {
+                Bucket::new(Entry {
                     station: station.to_vec(),
                     stats: StationStats::new(val),
-                }],
+                }),
             );
         }
     }
 
     fn merge(&mut self, other: Aggregator) {
         for (fingerprint, bucket) in other.station_map {
-            for entry in bucket {
+            for entry in bucket.into_entries() {
                 self.merge_entry(fingerprint, entry);
             }
         }
@@ -130,16 +185,13 @@ impl Aggregator {
 
     fn merge_entry(&mut self, fingerprint: u64, entry: Entry) {
         if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
-            if let Some(existing) = bucket
-                .iter_mut()
-                .find(|existing| existing.station.as_slice() == entry.station.as_slice())
-            {
+            if let Some(existing) = bucket.get_entry_mut(&entry.station) {
                 existing.stats.merge(entry.stats);
             } else {
-                bucket.push(entry);
+                bucket.push_entry(entry);
             }
         } else {
-            self.station_map.insert(fingerprint, vec![entry]);
+            self.station_map.insert(fingerprint, Bucket::new(entry));
         }
     }
 }
@@ -438,8 +490,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_aggregator.merge(partial);
     }
 
-    let mut station_entries: Vec<&Entry> =
-        final_aggregator.station_map().values().flatten().collect();
+    let mut station_entries: Vec<&Entry> = final_aggregator
+        .station_map()
+        .values()
+        .flat_map(|bucket| bucket.entries())
+        .collect();
     station_entries.sort_by(|a, b| a.station.cmp(&b.station));
     print_final_results(&station_entries);
 
