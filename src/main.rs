@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::File;
@@ -39,7 +38,7 @@ impl StationStats {
         }
     }
 
-    fn update_stats(&mut self, val: i32) {
+    fn update(&mut self, val: i32) {
         self.min = self.min.min(val);
         self.max = self.max.max(val);
         self.sum += val as i64;
@@ -77,121 +76,93 @@ impl fmt::Display for StationStats {
 }
 
 struct Entry {
+    fingerprint: u64,
     station: Vec<u8>,
     stats: StationStats,
 }
 
-enum Bucket {
-    Single(Entry),
-    Multi(Vec<Entry>),
+enum Slot {
+    Empty,
+    Occupied(Entry),
 }
 
-impl Bucket {
-    fn new(entry: Entry) -> Self {
-        Self::Single(entry)
-    }
-
-    fn get_entry_mut(&mut self, station: &[u8]) -> Option<&mut Entry> {
-        return match self {
-            Bucket::Single(entry) => {
-                if entry.station == station {
-                    Some(entry)
-                } else {
-                    None
-                }
-            }
-            Bucket::Multi(entries) => entries.iter_mut().find(|entry| entry.station == station),
-        };
-    }
-
-    fn push_entry(&mut self, entry: Entry) {
-        match self {
-            Bucket::Single(_) => {
-                let old_bucket = std::mem::replace(self, Bucket::Multi(Vec::new()));
-
-                let Bucket::Single(old_entry) = old_bucket else {
-                    unreachable!();
-                };
-
-                *self = Bucket::Multi(vec![old_entry, entry]);
-            }
-            Bucket::Multi(entries) => {
-                entries.push(entry);
-            }
-        }
-    }
-
-    fn into_entries(self) -> Vec<Entry> {
-        match self {
-            Bucket::Single(entry) => vec![entry],
-            Bucket::Multi(entries) => entries,
-        }
-    }
-
-    fn entries(&self) -> &[Entry] {
-        match self {
-            Bucket::Single(entry) => std::slice::from_ref(entry),
-            Bucket::Multi(entries) => entries,
-        }
-    }
-}
-
-/// Responsible for holding the running aggregation state for stations.
-///
-/// Represented as a HashMap, mapping fingerprints of station name to list of entries.
 struct Aggregator {
-    station_map: HashMap<u64, Bucket>,
+    slots: Vec<Slot>,
 }
 
 impl Aggregator {
-    fn new(station_map_size: usize) -> Self {
-        Self {
-            station_map: HashMap::with_capacity(station_map_size),
-        }
+    fn new(size: usize) -> Self {
+        let capacity = (size * 2).next_power_of_two();
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || Slot::Empty);
+
+        Self { slots }
     }
 
-    fn station_map(&self) -> &HashMap<u64, Bucket> {
-        &self.station_map
+    fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.slots.iter().filter_map(|slot| match slot {
+            Slot::Empty => None,
+            Slot::Occupied(entry) => Some(entry),
+        })
     }
 
     fn update(&mut self, fingerprint: u64, station: &[u8], val: i32) {
-        if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
-            if let Some(entry) = bucket.get_entry_mut(station) {
-                entry.stats.update_stats(val);
-            } else {
-                bucket.push_entry(Entry {
-                    station: station.to_vec(),
-                    stats: StationStats::new(val),
-                });
+        let mask = self.slots.len() - 1;
+        let mut idx = fingerprint as usize & mask;
+
+        loop {
+            match &mut self.slots[idx] {
+                Slot::Empty => {
+                    self.slots[idx] = Slot::Occupied(Entry {
+                        fingerprint,
+                        station: station.to_vec(),
+                        stats: StationStats::new(val),
+                    });
+                    return;
+                }
+                Slot::Occupied(found_entry) => {
+                    if found_entry.fingerprint == fingerprint && found_entry.station == station {
+                        found_entry.stats.update(val);
+                        return;
+                    }
+                }
             }
-        } else {
-            self.station_map.insert(
-                fingerprint,
-                Bucket::new(Entry {
-                    station: station.to_vec(),
-                    stats: StationStats::new(val),
-                }),
-            );
+
+            idx = (idx + 1) & mask;
         }
     }
 
     fn merge(&mut self, other: Aggregator) {
-        for (fingerprint, bucket) in other.station_map {
-            for entry in bucket.into_entries() {
-                self.merge_entry(fingerprint, entry);
+        for slot in other.slots {
+            if let Slot::Occupied(entry) = slot {
+                self.merge_entry(entry);
             }
         }
     }
 
-    fn merge_entry(&mut self, fingerprint: u64, entry: Entry) {
-        if let Some(bucket) = self.station_map.get_mut(&fingerprint) {
-            if let Some(existing) = bucket.get_entry_mut(&entry.station) {
-                existing.stats.merge(entry.stats);
-            } else {
-                bucket.push_entry(entry);
+    fn merge_entry(&mut self, entry: Entry) {
+        let mask = self.slots.len() - 1;
+        let mut idx = entry.fingerprint as usize & mask;
+        let mut entry = Some(entry);
+
+        loop {
+            match &mut self.slots[idx] {
+                Slot::Empty => {
+                    self.slots[idx] = Slot::Occupied(entry.take().unwrap());
+                    return;
+                }
+                Slot::Occupied(found_entry) => {
+                    let entry_ref = entry.as_ref().unwrap();
+                    if found_entry.fingerprint == entry_ref.fingerprint
+                        && found_entry.station == entry_ref.station
+                    {
+                        found_entry.stats.merge(entry.take().unwrap().stats);
+                        return;
+                    }
+                }
             }
-        } else {
-            self.station_map.insert(fingerprint, Bucket::new(entry));
+
+            idx = (idx + 1) & mask;
         }
     }
 }
@@ -490,11 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_aggregator.merge(partial);
     }
 
-    let mut station_entries: Vec<&Entry> = final_aggregator
-        .station_map()
-        .values()
-        .flat_map(|bucket| bucket.entries())
-        .collect();
+    let mut station_entries: Vec<&Entry> = final_aggregator.entries().collect();
     station_entries.sort_by(|a, b| a.station.cmp(&b.station));
     print_final_results(&station_entries);
 
